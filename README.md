@@ -14,7 +14,7 @@ Personal and team skills. Store your skills here and install them with `npx skil
 
 ```bash
 # Add a skill from this repo
-npx skills add ./skills/nestjs-backend-testing
+npx skills add https://github.com/hnakao/agent-skills --skill nestjs-backend-testing
 
 # Or clone and use local path
 git clone https://github.com/YOUR_USERNAME/agent-skills.git
