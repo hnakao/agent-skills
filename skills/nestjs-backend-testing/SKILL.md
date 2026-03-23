@@ -30,7 +30,7 @@ Specific situations that should trigger this skill:
 
 - **Database**: PostgreSQL, MySQL, MongoDB, SQLite (default: in-memory / mocked)
 - **ORM**: TypeORM, Prisma, Mongoose, MikroORM
-- **Mocking style**: Manual mocks, `jest.fn()`, `useMocker()`, `@golevelup/ts-jest`
+- **Mocking style**: `@golevelup/ts-jest` with `createMock` (default), manual mocks (legacy)
 - **Coverage target**: 80%, 90%, etc. (default: 80%)
 - **E2E tool**: Supertest (default for NestJS), TestClient, RestAssured
 
@@ -57,23 +57,19 @@ Install dependencies and configure Jest for both unit and e2e tests.
 
 ```bash
 npm install --save-dev jest ts-jest @types/jest supertest @types/supertest @nestjs/testing
-# Optional but recommended:
-npm install --save-dev @golevelup/ts-jest jest-mock
+# Strongly recommended for type-safe auto-mocking:
+npm install --save-dev @golevelup/ts-jest
 ```
 
 **`jest.config.js`** (unit tests):
 
 ```js
 module.exports = {
-  preset: 'ts-jest',
-  testEnvironment: 'node',
-  roots: ['<rootDir>/src'],
-  testRegex: '.*\\.spec\\.ts$',
-  collectCoverageFrom: [
-    'src/**/*.ts',
-    '!src/**/*.d.ts',
-    '!src/main.ts',
-  ],
+  preset: "ts-jest",
+  testEnvironment: "node",
+  roots: ["<rootDir>/src"],
+  testRegex: ".*\\.spec\\.ts$",
+  collectCoverageFrom: ["src/**/*.ts", "!src/**/*.d.ts", "!src/main.ts"],
   coverageThreshold: {
     global: {
       branches: 80,
@@ -128,26 +124,101 @@ Unit tests focus on one class at a time. Always use `Test.createTestingModule()`
 
 - No external I/O (pure logic) → plain Jest, no module needed
 - Class uses DI providers (repository, service, config) → `Test.createTestingModule()` with mocked providers
-- Class has many dependencies → use `useMocker()` for auto-mocking
+- Class has any dependencies → prefer `useMocker(createMock)` + `DeepMocked<T>` (see Mocking Strategy below)
 
-**Example — Service with mocked repository**:
+---
+
+### Mocking Strategy
+
+#### ✅ Preferred: `createMock` + `DeepMocked<T>` (default for all new tests)
+
+Use `@golevelup/ts-jest` for all controller and service unit tests. This is the default approach.
+
+**Why it's better than manual mocks:**
+
+- **Type-safe**: `DeepMocked<T>` gives full autocomplete and compile-time errors when the real class changes
+- **No drift**: if `AppointmentService` renames a method, your test fails at compile time instead of silently passing
+- **No boilerplate**: `useMocker(createMock)` auto-mocks every dependency — no manual list of methods to maintain
+- **No state bleed**: a fresh mock is created per `beforeEach`, so `.mockResolvedValue()` calls never leak between tests
+
+```typescript
+// src/appointments/appointment.controller.spec.ts
+import { Test, TestingModule } from "@nestjs/testing";
+import { createMock, DeepMocked } from "@golevelup/ts-jest";
+import { AppointmentController } from "./appointment.controller";
+import { AppointmentService } from "./appointment.service";
+
+describe("AppointmentController", () => {
+  let controller: AppointmentController;
+  let appointmentService: DeepMocked<AppointmentService>;
+
+  beforeEach(async () => {
+    const module: TestingModule = await Test.createTestingModule({
+      controllers: [AppointmentController],
+    })
+      .useMocker(createMock) // auto-mocks ALL dependencies
+      .compile();
+
+    controller = module.get(AppointmentController);
+    appointmentService = module.get(AppointmentService);
+    // No jest.clearAllMocks() needed — fresh mock per beforeEach
+  });
+
+  it("should be defined", () => {
+    expect(controller).toBeDefined();
+  });
+
+  it("createOne should call service with correct strategy when blockedAppointmentId is provided", async () => {
+    const dto = { title: "Test", blockedAppointmentId: "b-1" };
+    const reqUser = { id: "u-1" } as unknown as IUser;
+    appointmentService.createOne.mockResolvedValue({ id: "a-1" });
+
+    const result = await controller.createOne(dto, reqUser);
+
+    expect(appointmentService.createOne).toHaveBeenCalledWith(
+      dto,
+      { notUniqueStrategy: "update" },
+      reqUser,
+    );
+    expect(result).toEqual({ id: "a-1" });
+  });
+});
+```
+
+#### ⚠️ Legacy: Manual mocks (avoid for new tests)
+
+Manual mocks are acceptable when you need specific default return values shared across all tests in a suite, or when mocking loosely-typed third-party objects without TypeScript interfaces. In all other cases, prefer `createMock`.
+
+**Known pitfalls with manual mocks — do not repeat these mistakes:**
+
+```typescript
+// ❌ WRONG — mock declared outside beforeEach
+const mockService = { findOne: jest.fn() };
+// jest.clearAllMocks() only clears call counts, NOT implementations.
+// .mockResolvedValue() calls bleed between tests.
+
+// ✅ CORRECT — if you must use manual mocks, reset implementations too
+beforeEach(() => jest.resetAllMocks()); // resets both counts AND implementations
+```
+
+If you do use manual mocks, prefer `jest.resetAllMocks()` over `jest.clearAllMocks()` to prevent implementation bleed.
+
+---
+
+**Example — Service with mocked repository (using `createMock`)**:
 
 ```typescript
 // src/cats/cats.service.spec.ts
-import { Test, TestingModule } from '@nestjs/testing';
-import { getRepositoryToken } from '@nestjs/typeorm';
-import { CatsService } from './cats.service';
-import { Cat } from './cat.entity';
+import { Test, TestingModule } from "@nestjs/testing";
+import { getRepositoryToken } from "@nestjs/typeorm";
+import { createMock, DeepMocked } from "@golevelup/ts-jest";
+import { Repository } from "typeorm";
+import { CatsService } from "./cats.service";
+import { Cat } from "./cat.entity";
 
-const mockCatRepository = {
-  find: jest.fn(),
-  findOne: jest.fn(),
-  save: jest.fn(),
-  delete: jest.fn(),
-};
-
-describe('CatsService', () => {
+describe("CatsService", () => {
   let service: CatsService;
+  let catRepository: DeepMocked<Repository<Cat>>;
 
   beforeEach(async () => {
     const module: TestingModule = await Test.createTestingModule({
@@ -155,68 +226,33 @@ describe('CatsService', () => {
         CatsService,
         {
           provide: getRepositoryToken(Cat),
-          useValue: mockCatRepository,
+          useValue: createMock<Repository<Cat>>(),
         },
       ],
     }).compile();
 
-    service = module.get<CatsService>(CatsService);
-    jest.clearAllMocks();
+    service = module.get(CatsService);
+    catRepository = module.get(getRepositoryToken(Cat));
   });
 
-  describe('findAll', () => {
-    it('should return an array of cats', async () => {
-      const cats = [{ id: 1, name: 'Tom' }];
-      mockCatRepository.find.mockResolvedValue(cats);
+  describe("findAll", () => {
+    it("should return an array of cats", async () => {
+      const cats = [{ id: 1, name: "Tom" }];
+      catRepository.find.mockResolvedValue(cats);
 
       const result = await service.findAll();
 
       expect(result).toEqual(cats);
-      expect(mockCatRepository.find).toHaveBeenCalledTimes(1);
+      expect(catRepository.find).toHaveBeenCalledTimes(1);
     });
   });
 
-  describe('findOne', () => {
-    it('should throw NotFoundException when cat does not exist', async () => {
-      mockCatRepository.findOne.mockResolvedValue(null);
+  describe("findOne", () => {
+    it("should throw NotFoundException when cat does not exist", async () => {
+      catRepository.findOne.mockResolvedValue(null);
 
-      await expect(service.findOne(999)).rejects.toThrow('Cat not found');
+      await expect(service.findOne(999)).rejects.toThrow("Cat not found");
     });
-  });
-});
-```
-
-**Example — Auto-mocking with `useMocker()` (for classes with many deps)**:
-
-```typescript
-import { Test } from '@nestjs/testing';
-import { createMock } from '@golevelup/ts-jest';
-import { CatsController } from './cats.controller';
-import { CatsService } from './cats.service';
-
-describe('CatsController', () => {
-  let controller: CatsController;
-  let service: CatsService;
-
-  beforeEach(async () => {
-    const module = await Test.createTestingModule({
-      controllers: [CatsController],
-    })
-      .useMocker(createMock)
-      .compile();
-
-    controller = module.get(CatsController);
-    service = module.get(CatsService);
-  });
-
-  it('should call service.findAll and return result', async () => {
-    const cats = [{ id: 1, name: 'Tom' }];
-    jest.spyOn(service, 'findAll').mockResolvedValue(cats);
-
-    const result = await controller.findAll();
-
-    expect(result).toEqual(cats);
-    expect(service.findAll).toHaveBeenCalled();
   });
 });
 ```
@@ -225,26 +261,28 @@ describe('CatsController', () => {
 
 ```typescript
 // src/auth/jwt-auth.guard.spec.ts
-import { Test } from '@nestjs/testing';
-import { ExecutionContext } from '@nestjs/common';
-import { JwtAuthGuard } from './jwt-auth.guard';
-import { JwtService } from '@nestjs/jwt';
+import { Test } from "@nestjs/testing";
+import { ExecutionContext } from "@nestjs/common";
+import { createMock, DeepMocked } from "@golevelup/ts-jest";
+import { JwtAuthGuard } from "./jwt-auth.guard";
+import { JwtService } from "@nestjs/jwt";
 
-describe('JwtAuthGuard', () => {
+describe("JwtAuthGuard", () => {
   let guard: JwtAuthGuard;
+  let jwtService: DeepMocked<JwtService>;
 
   beforeEach(async () => {
     const module = await Test.createTestingModule({
-      providers: [
-        JwtAuthGuard,
-        { provide: JwtService, useValue: { verify: jest.fn() } },
-      ],
-    }).compile();
+      providers: [JwtAuthGuard],
+    })
+      .useMocker(createMock)
+      .compile();
 
     guard = module.get(JwtAuthGuard);
+    jwtService = module.get(JwtService);
   });
 
-  it('should deny access when no token is provided', () => {
+  it("should deny access when no token is provided", () => {
     const context = {
       switchToHttp: () => ({
         getRequest: () => ({ headers: {} }),
@@ -260,21 +298,21 @@ describe('JwtAuthGuard', () => {
 
 ```typescript
 // src/pipes/parse-int.pipe.spec.ts
-import { ParseIntPipe, BadRequestException } from '@nestjs/common';
+import { ParseIntPipe, BadRequestException } from "@nestjs/common";
 
-describe('ParseIntPipe', () => {
+describe("ParseIntPipe", () => {
   let pipe: ParseIntPipe;
 
   beforeEach(() => {
     pipe = new ParseIntPipe();
   });
 
-  it('should transform a numeric string to integer', async () => {
-    expect(await pipe.transform('5', { type: 'param' })).toBe(5);
+  it("should transform a numeric string to integer", async () => {
+    expect(await pipe.transform("5", { type: "param" })).toBe(5);
   });
 
-  it('should throw BadRequestException for non-numeric string', async () => {
-    await expect(pipe.transform('abc', { type: 'param' })).rejects.toThrow(
+  it("should throw BadRequestException for non-numeric string", async () => {
+    await expect(pipe.transform("abc", { type: "param" })).rejects.toThrow(
       BadRequestException,
     );
   });
@@ -289,13 +327,14 @@ Integration tests wire up a full NestJS module (with real DI) but mock infrastru
 
 ```typescript
 // src/cats/cats.integration.spec.ts
-import { Test, TestingModule } from '@nestjs/testing';
-import { CatsModule } from './cats.module';
-import { CatsService } from './cats.service';
-import { getRepositoryToken } from '@nestjs/typeorm';
-import { Cat } from './cat.entity';
+import { Test, TestingModule } from "@nestjs/testing";
+import { createMock } from "@golevelup/ts-jest";
+import { CatsModule } from "./cats.module";
+import { CatsService } from "./cats.service";
+import { getRepositoryToken } from "@nestjs/typeorm";
+import { Cat } from "./cat.entity";
 
-describe('CatsModule (integration)', () => {
+describe("CatsModule (integration)", () => {
   let module: TestingModule;
   let service: CatsService;
 
@@ -314,11 +353,11 @@ describe('CatsModule (integration)', () => {
 
   afterAll(() => module.close());
 
-  it('should resolve CatsService', () => {
+  it("should resolve CatsService", () => {
     expect(service).toBeDefined();
   });
 
-  it('should return empty array from findAll', async () => {
+  it("should return empty array from findAll", async () => {
     await expect(service.findAll()).resolves.toEqual([]);
   });
 });
@@ -332,15 +371,15 @@ E2E tests spin up a real Nest application and exercise HTTP routes end-to-end. O
 
 ```typescript
 // test/cats.e2e-spec.ts
-import * as request from 'supertest';
-import { Test } from '@nestjs/testing';
-import { INestApplication, ValidationPipe } from '@nestjs/common';
-import { AppModule } from '../src/app.module';
-import { CatsService } from '../src/cats/cats.service';
+import * as request from "supertest";
+import { Test } from "@nestjs/testing";
+import { INestApplication, ValidationPipe } from "@nestjs/common";
+import { AppModule } from "../src/app.module";
+import { CatsService } from "../src/cats/cats.service";
 
-describe('Cats (e2e)', () => {
+describe("Cats (e2e)", () => {
   let app: INestApplication;
-  const mockCatsService = { findAll: jest.fn(() => [{ id: 1, name: 'Tom' }]) };
+  const mockCatsService = { findAll: jest.fn(() => [{ id: 1, name: "Tom" }]) };
 
   beforeAll(async () => {
     const moduleRef = await Test.createTestingModule({
@@ -358,16 +397,16 @@ describe('Cats (e2e)', () => {
 
   afterAll(() => app.close());
 
-  it('GET /cats → 200 with cat array', () => {
+  it("GET /cats → 200 with cat array", () => {
     return request(app.getHttpServer())
-      .get('/cats')
+      .get("/cats")
       .expect(200)
-      .expect([{ id: 1, name: 'Tom' }]);
+      .expect([{ id: 1, name: "Tom" }]);
   });
 
-  it('POST /cats with invalid body → 400', () => {
+  it("POST /cats with invalid body → 400", () => {
     return request(app.getHttpServer())
-      .post('/cats')
+      .post("/cats")
       .send({}) // missing required fields
       .expect(400);
   });
@@ -389,14 +428,14 @@ First, update your module registration so the guard can be overridden:
 providers: [
   { provide: APP_GUARD, useExisting: JwtAuthGuard }, // NOT useClass
   JwtAuthGuard,
-]
+];
 ```
 
 Then override it in tests:
 
 ```typescript
 // test/auth.e2e-spec.ts
-import { MockAuthGuard } from './mocks/mock-auth.guard';
+import { MockAuthGuard } from "./mocks/mock-auth.guard";
 
 const moduleRef = await Test.createTestingModule({
   imports: [AppModule],
@@ -409,52 +448,54 @@ const moduleRef = await Test.createTestingModule({
 **Auth flow e2e example**:
 
 ```typescript
-describe('Auth (e2e)', () => {
+describe("Auth (e2e)", () => {
   let app: INestApplication;
   let accessToken: string;
 
-  beforeAll(async () => { /* init app without mocking auth */ });
+  beforeAll(async () => {
+    /* init app without mocking auth */
+  });
   afterAll(() => app.close());
 
-  describe('POST /auth/register', () => {
-    it('should register a new user', () => {
+  describe("POST /auth/register", () => {
+    it("should register a new user", () => {
       return request(app.getHttpServer())
-        .post('/auth/register')
-        .send({ email: 'test@example.com', password: 'Password123!' })
+        .post("/auth/register")
+        .send({ email: "test@example.com", password: "Password123!" })
         .expect(201)
-        .expect(res => {
-          expect(res.body).toHaveProperty('accessToken');
+        .expect((res) => {
+          expect(res.body).toHaveProperty("accessToken");
           accessToken = res.body.accessToken;
         });
     });
 
-    it('should reject duplicate email → 409', () => {
+    it("should reject duplicate email → 409", () => {
       return request(app.getHttpServer())
-        .post('/auth/register')
-        .send({ email: 'test@example.com', password: 'Password123!' })
+        .post("/auth/register")
+        .send({ email: "test@example.com", password: "Password123!" })
         .expect(409);
     });
   });
 
-  describe('GET /auth/me', () => {
-    it('should return current user with valid token', () => {
+  describe("GET /auth/me", () => {
+    it("should return current user with valid token", () => {
       return request(app.getHttpServer())
-        .get('/auth/me')
-        .set('Authorization', `Bearer ${accessToken}`)
+        .get("/auth/me")
+        .set("Authorization", `Bearer ${accessToken}`)
         .expect(200)
-        .expect(res => {
-          expect(res.body.email).toBe('test@example.com');
+        .expect((res) => {
+          expect(res.body.email).toBe("test@example.com");
         });
     });
 
-    it('should reject request without token → 401', () => {
-      return request(app.getHttpServer()).get('/auth/me').expect(401);
+    it("should reject request without token → 401", () => {
+      return request(app.getHttpServer()).get("/auth/me").expect(401);
     });
 
-    it('should reject invalid token → 401', () => {
+    it("should reject invalid token → 401", () => {
       return request(app.getHttpServer())
-        .get('/auth/me')
-        .set('Authorization', 'Bearer invalid-token')
+        .get("/auth/me")
+        .set("Authorization", "Bearer invalid-token")
         .expect(401);
     });
   });
@@ -473,7 +514,7 @@ Always mock external I/O: email senders, HTTP APIs, S3, queues, etc.
 // In your test module setup:
 {
   provide: MailService,
-  useValue: { sendVerificationEmail: jest.fn().mockResolvedValue(undefined) },
+  useValue: createMock<MailService>(), // auto-mocks all methods
 }
 ```
 
@@ -483,7 +524,7 @@ Always mock external I/O: email senders, HTTP APIs, S3, queues, etc.
 beforeEach(() => jest.useFakeTimers());
 afterEach(() => jest.useRealTimers());
 
-it('should expire token after 1 hour', () => {
+it("should expire token after 1 hour", () => {
   const token = generateToken();
   jest.advanceTimersByTime(60 * 60 * 1000 + 1);
   expect(isTokenExpired(token)).toBe(true);
@@ -493,10 +534,12 @@ it('should expire token after 1 hour', () => {
 **Mocking request-scoped providers** (advanced NestJS pattern):
 
 ```typescript
-import { ContextIdFactory } from '@nestjs/core';
+import { ContextIdFactory } from "@nestjs/core";
 
 const contextId = ContextIdFactory.create();
-jest.spyOn(ContextIdFactory, 'getByRequest').mockImplementation(() => contextId);
+jest
+  .spyOn(ContextIdFactory, "getByRequest")
+  .mockImplementation(() => contextId);
 
 const scopedService = await moduleRef.resolve(RequestScopedService, contextId);
 ```
@@ -509,21 +552,21 @@ For utility functions with no dependencies, skip `Test.createTestingModule()` an
 
 ```typescript
 // src/utils/password.util.spec.ts
-import { validatePassword } from './password.util';
+import { validatePassword } from "./password.util";
 
-describe('validatePassword', () => {
-  it('should accept a valid password', () => {
-    expect(validatePassword('Password123!').valid).toBe(true);
+describe("validatePassword", () => {
+  it("should accept a valid password", () => {
+    expect(validatePassword("Password123!").valid).toBe(true);
   });
 
-  it('should reject a password shorter than 8 characters', () => {
-    const { valid, errors } = validatePassword('P1!');
+  it("should reject a password shorter than 8 characters", () => {
+    const { valid, errors } = validatePassword("P1!");
     expect(valid).toBe(false);
-    expect(errors).toContain('Password must be at least 8 characters');
+    expect(errors).toContain("Password must be at least 8 characters");
   });
 
-  it('should return multiple errors for completely invalid input', () => {
-    expect(validatePassword('pass').errors.length).toBeGreaterThan(1);
+  it("should return multiple errors for completely invalid input", () => {
+    expect(validatePassword("pass").errors.length).toBeGreaterThan(1);
   });
 });
 ```
@@ -556,11 +599,11 @@ jest.config.js
 
 ### Test layer summary
 
-| Layer       | What to test                        | Tools                              | File suffix    |
-|-------------|-------------------------------------|------------------------------------|----------------|
-| Unit        | Single class, all deps mocked       | Jest + `Test.createTestingModule`  | `.spec.ts`     |
-| Integration | Full module, infra mocked           | Jest + `overrideProvider`          | `.spec.ts`     |
-| E2E         | Full HTTP request/response cycle    | Jest + Supertest                   | `.e2e-spec.ts` |
+| Layer       | What to test                     | Tools                                         | File suffix    |
+| ----------- | -------------------------------- | --------------------------------------------- | -------------- |
+| Unit        | Single class, all deps mocked    | Jest + `useMocker(createMock)` + `DeepMocked` | `.spec.ts`     |
+| Integration | Full module, infra mocked        | Jest + `overrideProvider`                     | `.spec.ts`     |
+| E2E         | Full HTTP request/response cycle | Jest + Supertest                              | `.e2e-spec.ts` |
 
 ### Coverage report
 
@@ -586,7 +629,8 @@ All files                 |   92.5  |   88.3   |   95.2  |   92.8  |
 ### Required (MUST)
 
 1. **Test isolation**: Every test must be independently runnable
-   - Reset mocks with `jest.clearAllMocks()` in `beforeEach`
+   - Use `useMocker(createMock)` + `beforeEach` module rebuild — mocks are fresh per test, no manual reset needed
+   - If using manual mocks, call `jest.resetAllMocks()` (not just `clearAllMocks`) to prevent implementation bleed
    - Never depend on execution order
 2. **Use `Test.createTestingModule()`**: Do not manually `new` NestJS classes with DI dependencies — this bypasses the DI system and misses wiring bugs
 3. **Mirror production middleware**: Apply the same `ValidationPipe`, exception filters, and interceptors in e2e test setup as in `main.ts`
@@ -594,6 +638,7 @@ All files                 |   92.5  |   88.3   |   95.2  |   92.8  |
    - ✅ `'should reject duplicate email → 409'`
    - ❌ `'test1'` or `'it works'`
 5. **Use `useExisting` for globally registered enhancers**: Required to make `overrideProvider()` work on `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER`
+6. **Prefer `DeepMocked<T>` over untyped mocks**: Always type mock variables as `DeepMocked<ServiceClass>` when using `createMock` — this ensures compile-time safety when the real class changes
 
 ### Prohibited (MUST NOT)
 
@@ -602,18 +647,33 @@ All files                 |   92.5  |   88.3   |   95.2  |   92.8  |
 3. **No `sleep()`/`setTimeout()` in tests**: Use `jest.useFakeTimers()` for time-dependent logic
 4. **No hardcoded secrets**: Reference `.env.test` or inject test values via `ConfigService` mock
 5. **Do not skip `app.close()` in `afterAll`**: Open handles cause Jest to hang after the test run
+6. **Do not declare mock objects outside `beforeEach`**: This causes implementation bleed between tests. If you need shared state, declare the variable outside but assign inside `beforeEach`
 
 ---
 
 ## Common Issues
 
-### Issue 1: Test failures caused by shared state
+### Issue 1: Test failures caused by shared mock state
 
 **Symptom**: Tests pass individually but fail when run together
-**Cause**: Missing `beforeEach` reset — mock state bleeds between tests
-**Fix**:
+**Cause**: Mock implementations (`.mockResolvedValue()`) set in one test bleed into the next.
+`jest.clearAllMocks()` only resets call counts — it does NOT reset implementations.
+
+**Fix with `createMock` (preferred)**: rebuild the module in `beforeEach` so mocks are always fresh:
+
 ```typescript
-beforeEach(() => jest.clearAllMocks());
+beforeEach(async () => {
+  const module = await Test.createTestingModule({ ... })
+    .useMocker(createMock)
+    .compile();
+  myService = module.get(MyService);
+});
+```
+
+**Fix with manual mocks (legacy)**: use `resetAllMocks` instead of `clearAllMocks`:
+
+```typescript
+beforeEach(() => jest.resetAllMocks()); // resets implementations AND call counts
 ```
 
 ---
@@ -623,6 +683,7 @@ beforeEach(() => jest.clearAllMocks());
 **Symptom**: Process hangs after all tests finish
 **Cause**: DB connections, Nest application, or HTTP server not closed
 **Fix**:
+
 ```typescript
 afterAll(async () => {
   await app.close(); // closes NestJS app and all its connections
@@ -636,17 +697,19 @@ afterAll(async () => {
 **Symptom**: `"Timeout - Async callback was not invoked within the 5000ms timeout"`
 **Cause**: Missing `await` on a Promise, or genuinely slow async operation
 **Fix**:
+
 ```typescript
 // Bad
-it('should work', () => {
-  request(app.getHttpServer()).get('/cats'); // Promise never awaited
+it("should work", () => {
+  request(app.getHttpServer()).get("/cats"); // Promise never awaited
 });
 
 // Good
-it('should work', async () => {
-  await request(app.getHttpServer()).get('/cats').expect(200);
+it("should work", async () => {
+  await request(app.getHttpServer()).get("/cats").expect(200);
 });
 ```
+
 For slow operations (e.g. DB seed), increase timeout: `jest.setTimeout(15000)`.
 
 ---
@@ -664,10 +727,25 @@ For slow operations (e.g. DB seed), increase timeout: `jest.setTimeout(15000)`.
 **Symptom**: `moduleRef.get(MyService)` throws or returns a stale instance
 **Cause**: `get()` only works for singleton-scoped providers; request/transient providers need `resolve()`
 **Fix**:
+
 ```typescript
 const contextId = ContextIdFactory.create();
-jest.spyOn(ContextIdFactory, 'getByRequest').mockImplementation(() => contextId);
+jest
+  .spyOn(ContextIdFactory, "getByRequest")
+  .mockImplementation(() => contextId);
 const service = await moduleRef.resolve(MyService, contextId);
+```
+
+---
+
+### Issue 6: `DeepMocked` methods are not callable
+
+**Symptom**: `TypeError: appointmentService.createOne is not a function`
+**Cause**: Getting the mock from the module before it's properly initialized, or using `module.get()` with the wrong token
+**Fix**: Ensure you retrieve the mock after `.compile()` using the exact class as the token:
+
+```typescript
+appointmentService = module.get(AppointmentService); // not module.get('AppointmentService')
 ```
 
 ---
@@ -682,16 +760,27 @@ const service = await moduleRef.resolve(MyService, contextId);
 4. **Integration tests** — verify DI wiring of each feature module
 5. **E2E tests for critical paths** — auth, payment, core CRUD
 
+### Choosing a mocking approach
+
+| Situation                                           | Recommended approach                                    |
+| --------------------------------------------------- | ------------------------------------------------------- |
+| Controller/service with any DI deps                 | `useMocker(createMock)` + `DeepMocked<T>`               |
+| Repository mock via `getRepositoryToken`            | `createMock<Repository<Entity>>()` as `useValue`        |
+| Guard, interceptor, pipe unit tests                 | `useMocker(createMock)`                                 |
+| Pure function (no DI)                               | Plain Jest, no module                                   |
+| Needs default return values shared across all tests | Manual mock with `jest.resetAllMocks()` in `beforeEach` |
+| Loosely-typed third-party object                    | Manual mock object                                      |
+
 ### TDD workflow
 
 Write the test first, watch it fail, then implement the minimum code to make it pass:
 
 ```typescript
 // 1. Write failing test
-it('should hash password before saving', async () => {
-  await service.createUser({ email: 'a@b.com', password: 'plain' });
-  const user = await repo.findOne({ email: 'a@b.com' });
-  expect(user.password).not.toBe('plain');
+it("should hash password before saving", async () => {
+  await service.createUser({ email: "a@b.com", password: "plain" });
+  const user = await repo.findOne({ email: "a@b.com" });
+  expect(user.password).not.toBe("plain");
 });
 
 // 2. Implement feature to make it pass
@@ -701,12 +790,14 @@ it('should hash password before saving', async () => {
 ### Given-When-Then for readable tests
 
 ```typescript
-it('should return 404 when user not found', async () => {
+it("should return 404 when user not found", async () => {
   // Given: a user ID that does not exist
-  const nonExistentId = 'non-existent-uuid';
+  const nonExistentId = "non-existent-uuid";
 
   // When: the endpoint is called
-  const response = await request(app.getHttpServer()).get(`/users/${nonExistentId}`);
+  const response = await request(app.getHttpServer()).get(
+    `/users/${nonExistentId}`,
+  );
 
   // Then: a 404 is returned
   expect(response.status).toBe(404);
@@ -718,14 +809,14 @@ it('should return 404 when user not found', async () => {
 ```typescript
 // test/fixtures/user.fixture.ts
 export const validUserPayload = {
-  email: 'test@example.com',
-  password: 'Password123!',
+  email: "test@example.com",
+  password: "Password123!",
 };
 
 export const adminUserPayload = {
-  email: 'admin@example.com',
-  password: 'Admin123!',
-  role: 'admin',
+  email: "admin@example.com",
+  password: "Admin123!",
+  role: "admin",
 };
 ```
 
@@ -755,7 +846,7 @@ Ensure tests don't share state (separate DB schemas or transaction rollback per 
 
 ### Tools
 
-- [`@golevelup/ts-jest`](https://github.com/golevelup/nestjs/tree/master/packages/testing) — `createMock` for auto-mocking in NestJS
+- [`@golevelup/ts-jest`](https://github.com/golevelup/nestjs/tree/master/packages/testing) — `createMock` + `DeepMocked<T>` for type-safe auto-mocking in NestJS (**default**)
 - [`jest-mock`](https://www.npmjs.com/package/jest-mock) — `ModuleMocker` for `useMocker()` factory
 - [Istanbul/nyc](https://istanbul.js.org/) — code coverage
 - [faker.js](https://fakerjs.dev/) — test data generation
@@ -767,10 +858,14 @@ Ensure tests don't share state (separate DB schemas or transaction rollback per 
 
 ### Version
 
-- **Current version**: 2.0.0
-- **Last updated**: 2026-03-19
+- **Current version**: 2.1.0
+- **Last updated**: 2026-03-23
 - **Base skill**: [supercent-io/skills-template/backend-testing](https://skills.sh/supercent-io/skills-template/backend-testing) v1.0.0
 - **Compatible platforms**: Claude, ChatGPT, Gemini, Copilot, Cursor, Codex
+
+### Changelog
+
+- **2.1.0**: Promoted `createMock` + `DeepMocked<T>` as the default mocking strategy. Added mocking strategy decision table. Demoted manual mocks to legacy. Fixed `clearAllMocks` vs `resetAllMocks` footgun. Added Issue 6. Updated all unit test examples to use `@golevelup/ts-jest`.
 
 ### Related skills
 
